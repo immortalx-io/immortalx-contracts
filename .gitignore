@@ -1,0 +1,12 @@
+artifacts
+cache
+node_modules
+.env
+.DS_Store
+coverage
+coverage.json
+typechain
+typechain-types
+scripts
+test
+contracts/token/Migrator.sol
