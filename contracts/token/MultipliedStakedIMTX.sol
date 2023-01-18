@@ -14,7 +14,7 @@ contract MultipliedStakedIMTX is IERC20, IRewardTracker, ReentrancyGuard, Govern
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
-    uint256 totalDistributedReward;
+    uint256 public totalDistributedReward;
 
     address public immutable distributor;
     address public immutable rewardToken;

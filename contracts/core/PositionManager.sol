@@ -33,16 +33,15 @@ contract PositionManager is Governable, ReentrancyGuard {
         uint256 timestamp;
     }
 
-    address public immutable collateralToken;
     address public immutable dex;
     address public immutable oracle;
+    address public immutable collateralToken;
 
     uint256 public positionValidDuration = 1800;
     uint256 public executeCooldownPublic = 180;
     uint256 public minMargin = 25 * BASE;
-    uint256 public immutable tokenBase;
-    uint256 public constant BASE = 10**8;
-    uint256 public constant FEE_BASE = 10**4;
+    uint256 private immutable tokenBase;
+    uint256 private constant BASE = 10**8;
 
     uint256 public openPositionKeysIndex;
     bytes32[] public openPositionKeys;
@@ -471,7 +470,7 @@ contract PositionManager is Governable, ReentrancyGuard {
     }
 
     function setMinMargin(uint256 _minMargin) external onlyGov {
-        require(_minMargin <= 25 * BASE);
+        require(_minMargin <= 50 * BASE);
         minMargin = _minMargin;
     }
 

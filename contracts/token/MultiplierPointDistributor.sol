@@ -31,6 +31,8 @@ contract MultiplierPointDistributor is IRewardDistributor, Governable {
         rewardToken = _rewardToken;
         rewardTracker = _rewardTracker;
         multiplierPointBP = _multiplierPointBP;
+
+        lastDistributionTime = block.timestamp;
     }
 
     function pendingRewards() public view override returns (uint256) {

@@ -669,7 +669,7 @@ contract OrderManager is ReentrancyGuard, Governable {
     }
 
     function setMinMargin(uint256 _minMargin) external onlyGov {
-        require(_minMargin <= 25 * BASE);
+        require(_minMargin <= 50 * BASE);
         minMargin = _minMargin;
     }
 
