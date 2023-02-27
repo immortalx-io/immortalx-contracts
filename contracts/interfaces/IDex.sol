@@ -13,6 +13,12 @@ interface IDex {
         uint256 leverage
     ) external;
 
+    function validateOpenPositionRequirements(
+        uint256 margin,
+        uint256 leverage,
+        uint256 productId
+    ) external view;
+
     function closePosition(
         address user,
         uint256 productId,
@@ -30,19 +36,13 @@ interface IDex {
 
     function getStakeShares(address user) external view returns (uint256);
 
-    function getProductToken(uint256 productId) external view returns (address);
-
     function getPositionLeverage(
         address account,
         uint256 productId,
         bool isLong
     ) external view returns (uint256);
 
-    function isPositionExists(
-        address account,
-        uint256 productId,
-        bool isLong
-    ) external view returns (bool);
+    function minMargin() external view returns (uint256);
 
     function totalProducts() external view returns (uint256);
 

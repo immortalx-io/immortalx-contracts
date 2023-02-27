@@ -25,8 +25,8 @@ contract VaultFeeRewardRouter is IVaultReward, ReentrancyGuard {
     uint256 public constant PRECISION = 10**18;
     uint256 public constant BASE = 10**8;
 
-    event ClaimReward(address user, address rewardToken, uint256 amount);
-    event CompoundReward(address user, address rewardToken, uint256 amount);
+    event ClaimReward(address user, uint256 amount);
+    event CompoundReward(address user, uint256 amount);
 
     constructor(
         address _dex,
@@ -60,7 +60,7 @@ contract VaultFeeRewardRouter is IVaultReward, ReentrancyGuard {
 
         if (rewardToSend > 0) {
             IERC20(rewardToken).safeTransfer(msg.sender, rewardToSend);
-            emit ClaimReward(msg.sender, rewardToken, rewardToSend);
+            emit ClaimReward(msg.sender, rewardToSend);
         }
     }
 
@@ -70,11 +70,10 @@ contract VaultFeeRewardRouter is IVaultReward, ReentrancyGuard {
         claimableReward[msg.sender] = 0;
 
         if (reinvestAmount > 0) {
-            IERC20(rewardToken).safeApprove(dex, 0);
-            IERC20(rewardToken).safeApprove(dex, reinvestAmount);
+            IERC20(rewardToken).safeIncreaseAllowance(dex, reinvestAmount);
             IDex(dex).stakeVaultToCompound(msg.sender, (reinvestAmount * 10**8) / rewardTokenBase);
 
-            emit CompoundReward(msg.sender, rewardToken, reinvestAmount);
+            emit CompoundReward(msg.sender, reinvestAmount);
         }
     }
 

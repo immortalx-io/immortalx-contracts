@@ -28,7 +28,6 @@ contract Dex is ReentrancyGuard, Governable {
         uint256 timestamp;
     }
     struct Product {
-        address productToken;
         bool isActive;
         uint256 maxLeverage;
         uint256 fee;
@@ -72,7 +71,7 @@ contract Dex is ReentrancyGuard, Governable {
     uint256 public utilizationMultiplier = 10000;
     uint256 public exposureMultiplier = 12000;
     uint256 public maxExposureMultiplier = 30000;
-    uint256 public liquidationThreshold = 9000;
+    uint256 public liquidationThreshold = 9850;
     uint256 public maxFundingRate = 10 * FUNDING_BASE;
     uint256 public vaultRewardRatio = 6000;
     uint256 public stakingRewardRatio = 4000;
@@ -80,6 +79,8 @@ contract Dex is ReentrancyGuard, Governable {
     uint256 private pendingStakingReward;
     uint256 private immutable tokenBase;
     uint256 private constant BASE = 10**8;
+    uint256 private constant PARAM_BASE = 10**4;
+    uint256 private constant TRADEFEE_BASE = 10**5;
     uint256 private constant FUNDING_BASE = 10**12;
 
     bool public isStakeEnabled = true;
@@ -89,8 +90,10 @@ contract Dex is ReentrancyGuard, Governable {
     mapping(uint256 => Product) private products;
     mapping(uint256 => Funding) private fundings;
     mapping(bytes32 => Position) public positions;
-    mapping(address => uint256) public claimableTraderRebates;
-    mapping(address => uint256) public claimableReferrerRebates;
+    mapping(address => uint256) public totalReferrerRebates;
+    mapping(address => uint256) public totalTraderRebates;
+    mapping(address => uint256) public claimedReferrerRebates;
+    mapping(address => uint256) public claimedTraderRebates;
     mapping(address => bool) public liquidators;
     mapping(address => bool) public guardians;
 
@@ -98,7 +101,7 @@ contract Dex is ReentrancyGuard, Governable {
 
     event StakeVault(address indexed user, uint256 amount, uint256 shares);
     event UnstakeVault(address indexed user, uint256 amount, uint256 shares, uint256 shareBalance, bool isFullRedeem);
-    event NewPosition(
+    event OpenPosition(
         bytes32 indexed positionKey,
         address indexed user,
         bool isLong,
@@ -112,27 +115,32 @@ contract Dex is ReentrancyGuard, Governable {
     event ClosePosition(
         bytes32 indexed positionKey,
         address indexed user,
+        bool isLiquidated,
         uint256 productId,
         uint256 price,
         uint256 entryPrice,
         uint256 margin,
         uint256 leverage,
-        uint256 fee,
         int256 pnl,
-        int256 fundingPayment,
-        bool wasLiquidated
+        int256 fundingFee
     );
+    event UpdateFunding(uint256 productId, int256 total, int256 fundingRate);
     event AddMargin(
         bytes32 indexed positionKey,
         address indexed user,
+        bool isLong,
+        uint256 productId,
         uint256 margin,
         uint256 newMargin,
         uint256 leverage,
         uint256 newLeverage
     );
-    event PositionLiquidated(bytes32 indexed positionKey);
+    event LiquidationError(bytes32 indexed positionKey, string executionError);
     event ClaimReferrerRebates(address indexed user, uint256 amount);
     event ClaimTraderRebates(address indexed user, uint256 amount);
+    event ReferralVolume(address referrer, address trader, uint256 volume);
+    event DistributeVaultReward(uint256 amount);
+    event DistributeStakingReward(uint256 amount);
     event SetPeripheralContracts(
         address oracle,
         address referralManager,
@@ -173,7 +181,7 @@ contract Dex is ReentrancyGuard, Governable {
         require(vault.staked + amount <= vault.cap, "vault cap exceeded");
 
         IVaultRewardRouter(vaultRewardRouter).updateRewards(user);
-        IERC20(token).safeTransferFrom(msg.sender, address(this), (amount * tokenBase) / 10**8);
+        IERC20(token).safeTransferFrom(msg.sender, address(this), (amount * tokenBase) / BASE);
 
         uint256 shares = vault.staked > 0 ? (amount * vault.shares) / vault.balance : amount;
         vault.balance += amount;
@@ -216,8 +224,8 @@ contract Dex is ReentrancyGuard, Governable {
         vault.balance -= shareBalance;
 
         if (isFullRedeem) delete stakes[user];
-        require(totalOpenInterest <= (vault.balance * utilizationMultiplier) / 10**4, "vault is being utilized");
-        IERC20(token).safeTransfer(user, (shareBalance * tokenBase) / 10**8);
+        require(totalOpenInterest <= (vault.balance * utilizationMultiplier) / PARAM_BASE, "vault is being utilized");
+        IERC20(token).safeTransfer(user, (shareBalance * tokenBase) / BASE);
 
         emit UnstakeVault(user, amount, shares, shareBalance, isFullRedeem);
     }
@@ -238,24 +246,23 @@ contract Dex is ReentrancyGuard, Governable {
         require(product.isActive, "!active");
         require(leverage <= product.maxLeverage, "!maxLeverage");
 
-        uint256 tradeFee = _getTradeFee(margin, leverage, product.fee);
-        IERC20(token).safeTransferFrom(msg.sender, address(this), ((margin + tradeFee) * tokenBase) / 10**8);
+        uint256 size = (margin * leverage) / BASE;
+        uint256 tradeFee = (size * product.fee) / TRADEFEE_BASE;
+        IERC20(token).safeTransferFrom(msg.sender, address(this), ((margin + tradeFee) * tokenBase) / BASE);
 
-        _updateFeeWithReferral(user, tradeFee);
+        _updateFeeWithReferral(user, tradeFee, size);
 
-        uint256 price;
-
-        price = _calculatePrice(
-            product.productToken,
+        uint256 price = _calculatePrice(
+            productId,
             isLong,
             product.openInterestLong,
             product.openInterestShort,
             getMaxExposure(product.weight),
             product.reserve,
-            (margin * leverage) / 10**8
+            size
         );
 
-        _updateFundingAndOpenInterest(productId, (margin * leverage) / 10**8, isLong, true);
+        _updateFundingAndOpenInterest(productId, size, isLong, true);
         int256 funding = fundings[productId].total;
 
         bytes32 positionKey = getPositionKey(user, productId, isLong);
@@ -265,11 +272,7 @@ contract Dex is ReentrancyGuard, Governable {
                 (position.margin * position.leverage * position.price + margin * leverage * price) /
                 (position.margin * position.leverage + margin * leverage);
             funding =
-                (int256(position.margin) *
-                    int256(position.leverage) *
-                    int256(position.funding) +
-                    int256(margin * leverage) *
-                    funding) /
+                (int256(position.margin * position.leverage) * position.funding + int256(margin * leverage) * funding) /
                 int256(position.margin * position.leverage + margin * leverage);
             leverage = (position.margin * position.leverage + margin * leverage) / (position.margin + margin);
             margin = position.margin + margin;
@@ -286,24 +289,27 @@ contract Dex is ReentrancyGuard, Governable {
             timestamp: block.timestamp
         });
 
-        emit NewPosition(positionKey, user, isLong, productId, margin, leverage, price, tradeFee, funding);
+        emit OpenPosition(positionKey, user, isLong, productId, margin, leverage, price, tradeFee, funding);
     }
 
-    function addMargin(bytes32 positionKey, uint256 margin) external nonReentrant {
+    function addMargin(
+        uint256 productId,
+        bool isLong,
+        uint256 margin
+    ) external nonReentrant {
+        bytes32 positionKey = getPositionKey(msg.sender, productId, isLong);
         Position storage position = positions[positionKey];
-        require(margin >= minMargin, "!minMargin");
-        require(msg.sender == position.owner, "!position.owner (addMargin)");
-        IERC20(token).safeTransferFrom(msg.sender, address(this), (margin * tokenBase) / 10**8);
 
         uint256 newMargin = position.margin + margin;
         uint256 leverage = position.leverage;
         uint256 newLeverage = (leverage * position.margin) / newMargin;
         require(newLeverage >= minLeverage, "!minleverage");
 
+        IERC20(token).safeTransferFrom(msg.sender, address(this), (margin * tokenBase) / BASE);
         position.margin = newMargin;
         position.leverage = newLeverage;
 
-        emit AddMargin(positionKey, msg.sender, margin, newMargin, leverage, newLeverage);
+        emit AddMargin(positionKey, msg.sender, isLong, productId, margin, newMargin, leverage, newLeverage);
     }
 
     function closePosition(
@@ -316,55 +322,45 @@ contract Dex is ReentrancyGuard, Governable {
     }
 
     function _closePosition(bytes32 positionKey, uint256 margin) private {
-        require(margin > 0, "invalid margin");
         require(msg.sender == positionManager || msg.sender == orderManager, "!manager");
+        if (margin == 0) return;
 
         Position storage position = positions[positionKey];
-        Product storage product = products[position.productId];
+        if (position.owner == address(0)) return; // position does not exist
 
-        bool isFullClose;
-        if (margin >= position.margin) {
+        Product memory product = products[position.productId];
+
+        if (margin > position.margin) {
             margin = position.margin;
-            isFullClose = true;
         }
 
-        uint256 price;
-
-        price = _calculatePrice(
-            product.productToken,
+        uint256 size = (margin * position.leverage) / BASE;
+        uint256 price = _calculatePrice(
+            position.productId,
             !position.isLong,
             product.openInterestLong,
             product.openInterestShort,
             getMaxExposure(product.weight),
             product.reserve,
-            (margin * position.leverage) / 10**8
+            size
         );
 
-        _updateFundingAndOpenInterest(position.productId, (margin * position.leverage) / 10**8, position.isLong, false);
-        int256 fundingPayment = _getFundingPayment(
-            position.isLong,
-            position.productId,
-            position.leverage,
-            margin,
-            position.funding
-        );
+        _updateFundingAndOpenInterest(position.productId, size, position.isLong, false);
+        int256 fundingFee = getFundingFee(position.isLong, position.productId, size, position.funding);
 
-        int256 pnl = _getPnl(position.isLong, position.price, position.leverage, margin, price) - fundingPayment;
-        bool isLiquidatable;
-        if (pnl < 0 && uint256(-1 * pnl) >= (margin * liquidationThreshold) / 10**4) {
-            margin = position.margin;
-            pnl = -1 * int256(position.margin);
-            isLiquidatable = true;
+        int256 pnl = getPnl(position.isLong, position.price, position.leverage, margin, price) - fundingFee;
+        if (pnl < 0) {
+            require(uint256(-1 * pnl) < (margin * liquidationThreshold) / PARAM_BASE, "position should be liquidated");
         }
 
-        uint256 tradeFee = _getTradeFee(margin, position.leverage, product.fee);
+        uint256 tradeFee = (size * product.fee) / TRADEFEE_BASE;
         int256 pnlAfterFee = pnl - int256(tradeFee);
 
         if (pnlAfterFee < 0) {
             uint256 _pnlAfterFee = uint256(-1 * pnlAfterFee);
 
             if (_pnlAfterFee < margin) {
-                IERC20(token).safeTransfer(position.owner, ((margin - _pnlAfterFee) * tokenBase) / 10**8);
+                IERC20(token).safeTransfer(position.owner, ((margin - _pnlAfterFee) * tokenBase) / BASE);
                 vault.balance += _pnlAfterFee;
             } else {
                 vault.balance += margin;
@@ -373,29 +369,28 @@ contract Dex is ReentrancyGuard, Governable {
             uint256 _pnlAfterFee = uint256(pnlAfterFee);
             require(vault.balance >= _pnlAfterFee, "insufficient vault balance");
 
-            IERC20(token).safeTransfer(position.owner, ((margin + _pnlAfterFee) * tokenBase) / 10**8);
+            IERC20(token).safeTransfer(position.owner, ((margin + _pnlAfterFee) * tokenBase) / BASE);
             vault.balance -= _pnlAfterFee;
         }
 
-        _updateFeeWithReferral(position.owner, tradeFee);
+        _updateFeeWithReferral(position.owner, tradeFee, size);
         vault.balance -= tradeFee;
 
         emit ClosePosition(
             positionKey,
             position.owner,
+            false,
             position.productId,
             price,
             position.price,
             margin,
             position.leverage,
-            tradeFee,
             pnl,
-            fundingPayment,
-            isLiquidatable
+            fundingFee
         );
 
-        if (isFullClose || isLiquidatable) {
-            IOrderManager(orderManager).cancelPositionCloseOrders(position.owner, position.productId, position.isLong);
+        if (margin == position.margin) {
+            IOrderManager(orderManager).cancelActiveCloseOrders(position.owner, position.productId, position.isLong);
             delete positions[positionKey];
         } else {
             position.margin -= margin;
@@ -406,75 +401,71 @@ contract Dex is ReentrancyGuard, Governable {
         require(liquidators[msg.sender], "!liquidator");
 
         for (uint256 i = 0; i < positionKeys.length; ++i) {
-            _liquidatePosition(positionKeys[i]);
+            try this.liquidatePosition(positionKeys[i]) {} catch Error(string memory errorMessage) {
+                emit LiquidationError(positionKeys[i], errorMessage);
+            } catch (bytes memory) {}
         }
     }
 
-    function _liquidatePosition(bytes32 positionKey) private {
-        Position storage position = positions[positionKey];
-        Product storage product = products[position.productId];
+    function liquidatePosition(bytes32 positionKey) external {
+        require(msg.sender == address(this), "invalid liquidator");
 
-        uint256 price = IOracle(oracle).getPrice(product.productToken);
+        Position memory position = positions[positionKey];
+        if (position.owner == address(0)) return; // position does not exist
 
-        _updateFundingAndOpenInterest(
-            position.productId,
-            (position.margin * position.leverage) / 10**8,
-            position.isLong,
-            false
+        Product memory product = products[position.productId];
+
+        uint256 size = (position.margin * position.leverage) / BASE;
+        uint256 price = IOracle(oracle).getPrice(position.productId);
+
+        _updateFundingAndOpenInterest(position.productId, size, position.isLong, false);
+        int256 fundingFee = getFundingFee(position.isLong, position.productId, size, position.funding);
+
+        int256 pnl = getPnl(position.isLong, position.price, position.leverage, position.margin, price) - fundingFee;
+        require(
+            pnl < 0 && uint256(-1 * pnl) >= (position.margin * liquidationThreshold) / PARAM_BASE,
+            "position is not liquidatable"
         );
-        int256 fundingPayment = _getFundingPayment(
-            position.isLong,
-            position.productId,
-            position.leverage,
-            position.margin,
-            position.funding
-        );
 
-        int256 pnl = _getPnl(position.isLong, position.price, position.leverage, position.margin, price) -
-            fundingPayment;
-        require(pnl < 0 && uint256(-1 * pnl) >= (position.margin * liquidationThreshold) / 10**4);
-
-        uint256 tradeFee = _getTradeFee(position.margin, position.leverage, product.fee);
-        _updateFeeWithReferral(position.owner, tradeFee);
+        uint256 tradeFee = (size * product.fee) / TRADEFEE_BASE;
+        _updateFeeWithReferral(position.owner, tradeFee, size);
         vault.balance += position.margin - tradeFee;
 
         emit ClosePosition(
             positionKey,
             position.owner,
+            true,
             position.productId,
             price,
             position.price,
             position.margin,
             position.leverage,
-            0,
             -1 * int256(position.margin),
-            fundingPayment,
-            true
+            fundingFee
         );
-        emit PositionLiquidated(positionKey);
 
-        IOrderManager(orderManager).cancelPositionCloseOrders(position.owner, position.productId, position.isLong);
+        IOrderManager(orderManager).cancelActiveCloseOrders(position.owner, position.productId, position.isLong);
         delete positions[positionKey];
     }
 
     function claimReferrerRebates() external nonReentrant {
-        uint256 _claimableReferrerRebates = claimableReferrerRebates[msg.sender];
-        require(_claimableReferrerRebates > 0, "Not claimable");
+        uint256 claimableReferrerRebates = totalReferrerRebates[msg.sender] - claimedReferrerRebates[msg.sender];
+        require(claimableReferrerRebates > 0, "Not claimable");
 
-        claimableReferrerRebates[msg.sender] = 0;
-        IERC20(token).safeTransfer(msg.sender, _claimableReferrerRebates);
+        claimedReferrerRebates[msg.sender] += claimableReferrerRebates;
+        IERC20(token).safeTransfer(msg.sender, claimableReferrerRebates);
 
-        emit ClaimReferrerRebates(msg.sender, _claimableReferrerRebates);
+        emit ClaimReferrerRebates(msg.sender, claimableReferrerRebates);
     }
 
     function claimTraderRebates() external nonReentrant {
-        uint256 _claimableTraderRebates = claimableTraderRebates[msg.sender];
-        require(_claimableTraderRebates > 0, "Not claimable");
+        uint256 claimableTraderRebates = totalTraderRebates[msg.sender] - claimedTraderRebates[msg.sender];
+        require(claimableTraderRebates > 0, "Not claimable");
 
-        claimableTraderRebates[msg.sender] = 0;
-        IERC20(token).safeTransfer(msg.sender, _claimableTraderRebates);
+        claimedTraderRebates[msg.sender] += claimableTraderRebates;
+        IERC20(token).safeTransfer(msg.sender, claimableTraderRebates);
 
-        emit ClaimTraderRebates(msg.sender, _claimableTraderRebates);
+        emit ClaimTraderRebates(msg.sender, claimableTraderRebates);
     }
 
     function distributeVaultReward() external returns (uint256) {
@@ -485,6 +476,8 @@ contract Dex is ReentrancyGuard, Governable {
         if (_pendingVaultReward > 0) {
             pendingVaultReward = 0;
             IERC20(token).safeTransfer(_vaultRewardReceiver, _pendingVaultReward);
+
+            emit DistributeVaultReward(_pendingVaultReward);
         }
         return _pendingVaultReward;
     }
@@ -497,12 +490,14 @@ contract Dex is ReentrancyGuard, Governable {
         if (_pendingStakingReward > 0) {
             pendingStakingReward = 0;
             IERC20(token).safeTransfer(_stakingRewardReceiver, _pendingStakingReward);
+
+            emit DistributeStakingReward(_pendingStakingReward);
         }
         return _pendingStakingReward;
     }
 
     function getMaxExposure(uint256 productWeight) public view returns (uint256) {
-        return (vault.balance * productWeight * exposureMultiplier) / totalWeight / 10**4;
+        return (vault.balance * productWeight * exposureMultiplier) / totalWeight / PARAM_BASE;
     }
 
     function getFundingRate(uint256 productId) public view returns (int256) {
@@ -531,16 +526,8 @@ contract Dex is ReentrancyGuard, Governable {
         }
     }
 
-    function _getTradeFee(
-        uint256 margin,
-        uint256 leverage,
-        uint256 productFee
-    ) private pure returns (uint256) {
-        return (margin * leverage * productFee) / 10**12;
-    }
-
     function _calculatePrice(
-        address productToken,
+        uint256 productId,
         bool isLong,
         uint256 openInterestLong,
         uint256 openInterestShort,
@@ -548,20 +535,20 @@ contract Dex is ReentrancyGuard, Governable {
         uint256 reserve,
         uint256 amount
     ) private view returns (uint256) {
-        uint256 oraclePrice = IOracle(oracle).getPrice(productToken, isLong);
+        uint256 oraclePrice = IOracle(oracle).getPrice(productId, isLong);
 
         if (reserve > 0) {
             int256 shift = ((int256(openInterestLong) - int256(openInterestShort)) * int256(maxShift)) /
                 int256(maxExposure);
 
             if (isLong) {
-                uint256 slippage = (((reserve * reserve) / (reserve - amount) - reserve) * 10**8) / amount;
+                uint256 slippage = (((reserve * reserve) / (reserve - amount) - reserve) * BASE) / amount;
                 slippage = shift >= 0 ? slippage + uint256(shift) : slippage - (uint256(-1 * shift) / shiftDivider);
-                return (oraclePrice * slippage) / 10**8;
+                return (oraclePrice * slippage) / BASE;
             } else {
-                uint256 slippage = ((reserve - (reserve * reserve) / (reserve + amount)) * 10**8) / amount;
+                uint256 slippage = ((reserve - (reserve * reserve) / (reserve + amount)) * BASE) / amount;
                 slippage = shift >= 0 ? slippage + (uint256(shift) / shiftDivider) : slippage - uint256(-1 * shift);
-                return (oraclePrice * slippage) / 10**8;
+                return (oraclePrice * slippage) / BASE;
             }
         } else {
             return oraclePrice;
@@ -579,6 +566,7 @@ contract Dex is ReentrancyGuard, Governable {
         if (funding.timestamp != 0) {
             int256 fundingRate = getFundingRate(productId);
             funding.total += (fundingRate * int256(block.timestamp - funding.timestamp)) / int256(365 days);
+            emit UpdateFunding(productId, funding.total, fundingRate);
         }
         funding.timestamp = block.timestamp;
 
@@ -587,7 +575,7 @@ contract Dex is ReentrancyGuard, Governable {
         if (isIncrease) {
             totalOpenInterest += amount;
             uint256 maxExposure = getMaxExposure(product.weight);
-            require(totalOpenInterest <= (vault.balance * utilizationMultiplier) / 10**4, "!totalOpenInterest");
+            require(totalOpenInterest <= (vault.balance * utilizationMultiplier) / PARAM_BASE, "!totalOpenInterest");
             require(
                 product.openInterestLong + product.openInterestShort + amount <
                     (maxExposureMultiplier * maxExposure) / 10000,
@@ -620,51 +608,56 @@ contract Dex is ReentrancyGuard, Governable {
         }
     }
 
-    function _getFundingPayment(
+    function getFundingFee(
         bool isLong,
         uint256 productId,
-        uint256 positionLeverage,
-        uint256 margin,
+        uint256 size,
         int256 funding
-    ) private view returns (int256) {
+    ) public view returns (int256) {
         return
             isLong
-                ? (int256(margin * positionLeverage) * (fundings[productId].total - funding)) / int256(1e20)
-                : (int256(margin * positionLeverage) * (funding - fundings[productId].total)) / int256(1e20);
+                ? (int256(size) * (fundings[productId].total - funding)) / int256(FUNDING_BASE)
+                : (int256(size) * (funding - fundings[productId].total)) / int256(FUNDING_BASE);
     }
 
-    function _getPnl(
+    function getPnl(
         bool isLong,
         uint256 positionPrice,
         uint256 positionLeverage,
         uint256 margin,
         uint256 price
-    ) private pure returns (int256) {
+    ) public pure returns (int256) {
         if (isLong) {
             if (price >= positionPrice) {
-                return int256((margin * positionLeverage * (price - positionPrice)) / positionPrice / 10**8);
+                return int256((margin * positionLeverage * (price - positionPrice)) / positionPrice / BASE);
             } else {
-                return -1 * int256((margin * positionLeverage * (positionPrice - price)) / positionPrice / 10**8);
+                return -1 * int256((margin * positionLeverage * (positionPrice - price)) / positionPrice / BASE);
             }
         } else {
             if (price > positionPrice) {
-                return -1 * int256((margin * positionLeverage * (price - positionPrice)) / positionPrice / 10**8);
+                return -1 * int256((margin * positionLeverage * (price - positionPrice)) / positionPrice / BASE);
             } else {
-                return int256((margin * positionLeverage * (positionPrice - price)) / positionPrice / 10**8);
+                return int256((margin * positionLeverage * (positionPrice - price)) / positionPrice / BASE);
             }
         }
     }
 
-    function _updateFeeWithReferral(address user, uint256 tradeFee) private {
+    function _updateFeeWithReferral(
+        address user,
+        uint256 tradeFee,
+        uint256 size
+    ) private {
         (address referrer, uint256 referrerRebate, uint256 traderRebate) = IReferralManager(referralManager)
             .getReferrerInfo(user);
-        uint256 _tradeFee = (tradeFee * tokenBase) / 10**8;
+        uint256 _tradeFee = (tradeFee * tokenBase) / BASE;
 
         if (referrer != address(0)) {
-            uint256 referrerRebateAmount = (_tradeFee * referrerRebate) / 10**4;
-            uint256 traderRebateAmount = (_tradeFee * traderRebate) / 10**4;
-            claimableReferrerRebates[referrer] += referrerRebateAmount;
-            claimableTraderRebates[user] += traderRebateAmount;
+            uint256 referrerRebateAmount = (_tradeFee * referrerRebate) / PARAM_BASE;
+            uint256 traderRebateAmount = (_tradeFee * traderRebate) / PARAM_BASE;
+            totalReferrerRebates[referrer] += referrerRebateAmount;
+            totalTraderRebates[user] += traderRebateAmount;
+
+            emit ReferralVolume(referrer, user, size);
 
             _updatePendingRewards(_tradeFee - referrerRebateAmount - traderRebateAmount);
         } else {
@@ -673,9 +666,21 @@ contract Dex is ReentrancyGuard, Governable {
     }
 
     function _updatePendingRewards(uint256 reward) private {
-        uint256 vaultReward = (reward * vaultRewardRatio) / 10**4;
+        uint256 vaultReward = (reward * vaultRewardRatio) / PARAM_BASE;
         pendingVaultReward += vaultReward;
         pendingStakingReward += reward - vaultReward;
+    }
+
+    function validateOpenPositionRequirements(
+        uint256 margin,
+        uint256 leverage,
+        uint256 productId
+    ) external view {
+        require(isOpenPositionEnabled, "open position is disabled");
+        require(margin >= minMargin && margin < type(uint64).max, "!margin");
+        require(leverage >= minLeverage, "!minLeverage");
+        require(products[productId].isActive, "!active");
+        require(leverage <= products[productId].maxLeverage, "!maxLeverage");
     }
 
     function getVault() external view returns (Vault memory) {
@@ -696,10 +701,6 @@ contract Dex is ReentrancyGuard, Governable {
 
     function getProduct(uint256 productId) external view returns (Product memory) {
         return products[productId];
-    }
-
-    function getProductToken(uint256 productId) external view returns (address) {
-        return products[productId].productToken;
     }
 
     function getFunding(uint256 productId) external view returns (Funding memory) {
@@ -730,13 +731,18 @@ contract Dex is ReentrancyGuard, Governable {
         return positions[getPositionKey(account, productId, isLong)].leverage;
     }
 
-    function getUserPositions(address user) external view returns (Position[] memory userPositions) {
-        uint256 _totalProducts = totalProducts;
-        userPositions = new Position[](_totalProducts * 2);
+    function getUserPositions(
+        address user,
+        uint256 startId,
+        uint256 endId
+    ) external view returns (Position[] memory userPositions) {
+        require(startId > 0, "!startId");
+        if (endId > totalProducts) endId = totalProducts;
+        userPositions = new Position[]((endId - startId + 1) * 2);
         bytes32 positionKey;
         uint256 count;
 
-        for (uint256 i = 1; i <= _totalProducts; ++i) {
+        for (uint256 i = startId; i <= endId; ++i) {
             positionKey = getPositionKey(user, i, true);
             if (positions[positionKey].owner != address(0)) userPositions[count++] = positions[positionKey];
 
@@ -745,12 +751,20 @@ contract Dex is ReentrancyGuard, Governable {
         }
     }
 
-    function isPositionExists(
-        address account,
-        uint256 productId,
-        bool isLong
-    ) external view returns (bool) {
-        return positions[getPositionKey(account, productId, isLong)].owner != address(0);
+    function getFundingData(uint256 startId, uint256 endId)
+        external
+        view
+        returns (int256[] memory fundingRates, int256[] memory fundingTotals)
+    {
+        require(startId > 0, "!startId");
+        if (endId > totalProducts) endId = totalProducts;
+        fundingRates = new int256[]((endId - startId + 1) * 2);
+        fundingTotals = new int256[]((endId - startId + 1) * 2);
+
+        for (uint256 i = startId; i <= endId; ++i) {
+            fundingRates[i - 1] = getFundingRate(i);
+            fundingTotals[i - 1] = fundings[i].total;
+        }
     }
 
     function getTradeFee(
@@ -758,7 +772,7 @@ contract Dex is ReentrancyGuard, Governable {
         uint256 leverage,
         uint256 productId
     ) external view returns (uint256) {
-        return (margin * leverage * products[productId].fee) / 10**12;
+        return (margin * leverage * products[productId].fee) / (BASE * TRADEFEE_BASE);
     }
 
     function getPendingVaultReward() external view returns (uint256) {
@@ -806,43 +820,56 @@ contract Dex is ReentrancyGuard, Governable {
         emit UpdateVault(vault);
     }
 
-    function addProduct(uint256 productId, Product memory _product) external onlyGov {
-        Product memory product = products[productId];
-
+    function addProduct(
+        uint256 productId,
+        uint256 _maxLeverage,
+        uint256 _fee,
+        uint256 _weight,
+        uint256 _reserve
+    ) external onlyGov {
         require(productId > 0, "invalid productId");
-        require(product.maxLeverage == 0 && _product.maxLeverage >= 1 * BASE && _product.productToken != address(0));
 
+        Product memory product = products[productId];
+        require(product.maxLeverage == 0, "product exists");
+
+        require(_maxLeverage >= 1 * BASE && _fee <= 10**3, "invalid product");
         products[productId] = Product({
-            productToken: _product.productToken,
             isActive: true,
-            maxLeverage: _product.maxLeverage,
-            fee: _product.fee,
-            weight: _product.weight,
-            reserve: _product.reserve,
+            maxLeverage: _maxLeverage,
+            fee: _fee,
+            weight: _weight,
+            reserve: _reserve,
             openInterestLong: 0,
             openInterestShort: 0
         });
 
-        totalWeight = totalWeight + _product.weight;
+        totalWeight += _weight;
         totalProducts += 1;
 
         emit AddProduct(productId, products[productId]);
     }
 
-    function updateProduct(uint256 productId, Product memory _product) external onlyGov {
-        Product storage product = products[productId];
-
+    function updateProduct(
+        uint256 productId,
+        bool _isActive,
+        uint256 _maxLeverage,
+        uint256 _fee,
+        uint256 _weight,
+        uint256 _reserve
+    ) external onlyGov {
         require(productId > 0, "invalid productId");
-        require(product.maxLeverage > 0 && _product.maxLeverage >= 1 * BASE && _product.productToken != address(0));
 
-        totalWeight = totalWeight - product.weight + _product.weight;
+        Product storage product = products[productId];
+        require(product.maxLeverage > 0, "product not exists");
 
-        product.productToken = _product.productToken;
-        product.isActive = _product.isActive;
-        product.maxLeverage = _product.maxLeverage;
-        product.fee = _product.fee;
-        product.weight = _product.weight;
-        product.reserve = _product.reserve;
+        require(_maxLeverage >= 1 * BASE && _fee <= 10**3, "invalid product");
+        totalWeight = totalWeight - product.weight + _weight;
+
+        product.isActive = _isActive;
+        product.maxLeverage = _maxLeverage;
+        product.fee = _fee;
+        product.weight = _weight;
+        product.reserve = _reserve;
 
         emit UpdateProduct(productId, product);
     }
@@ -856,26 +883,31 @@ contract Dex is ReentrancyGuard, Governable {
         require(index >= 1 && index <= 9, "invalid index for parameter");
 
         if (index == 1) {
+            require(value >= 25 * BASE, "invalid minMargin");
             minMargin = value;
         } else if (index == 2) {
+            require(value <= 1 * BASE, "invalid minLeverage");
             minLeverage = value;
         } else if (index == 3) {
-            require(value < 0.01e8);
+            require(value < 0.01e8, "invalid maxShift");
             maxShift = value;
         } else if (index == 4) {
-            require(value > 0);
+            require(value > 0, "invalid shiftDivider");
             shiftDivider = value;
         } else if (index == 5) {
+            require(value > 0, "invalid utilizationMultiplier");
             utilizationMultiplier = value;
         } else if (index == 6) {
+            require(value > 0, "invalid exposureMultiplier");
             exposureMultiplier = value;
         } else if (index == 7) {
-            require(value > 0);
+            require(value > 0, "invalid maxExposureMultiplier");
             maxExposureMultiplier = value;
         } else if (index == 8) {
-            require(value >= 9000);
+            require(value >= 9500, "invalid liquidationThreshold");
             liquidationThreshold = value;
         } else if (index == 9) {
+            require(value <= 10 * FUNDING_BASE, "invalid maxFundingRate");
             maxFundingRate = value;
         }
 
